@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -48,37 +49,63 @@ func WriteKV(w http.ResponseWriter, r *http.Request) {
 
 	// Step 2: Check if this is a replication request
 	if r.Header.Get("X-Replicated") == "true" {
-		// Don't replicate further
-		logger.Info("replication request received — not re‑replicating",
-			zap.String("key", key))
+		logger.Info("replication request received — not re‑replicating", zap.String("key", key))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Step 3: Replicate to peers
-	for _, peer := range peers {
-		url := fmt.Sprintf("%s/write?key=%s", peer, key)
-		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-		req.Header.Set("Content-Type", "text/plain")
-		req.Header.Set("X-Replicated", "true") // ✅ mark replication request
+	// Step 3: Parallel Replication with WaitGroup
+	var wg sync.WaitGroup
+	successChan := make(chan string, len(peers))
+	failChan := make(chan string, len(peers))
 
-		client := &http.Client{Timeout: 5 * time.Second}
-		resp, err := client.Do(req)
-		if err != nil {
-			logger.Error("replication failed", zap.String("peer", peer), zap.Error(err))
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			logger.Info("replication success", zap.String("peer", peer))
-		} else {
-			logger.Warn("peer returned non‑OK", zap.String("peer", peer),
-				zap.Int("status", resp.StatusCode))
-		}
+	for _, peer := range peers {
+		wg.Add(1)
+		go func(peer string) {
+			defer wg.Done()
+
+			url := fmt.Sprintf("%s/write?key=%s", peer, key)
+			req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+			req.Header.Set("Content-Type", "text/plain")
+			req.Header.Set("X-Replicated", "true") // prevent re-replication
+
+			client := &http.Client{Timeout: 3 * time.Second}
+			resp, err := client.Do(req)
+			if err != nil {
+				logger.Error("replication failed", zap.String("peer", peer), zap.Error(err))
+				failChan <- peer
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK {
+				logger.Info("replication success", zap.String("peer", peer))
+				successChan <- peer
+			} else {
+				logger.Warn("peer returned non-OK", zap.String("peer", peer), zap.Int("status", resp.StatusCode))
+				failChan <- peer
+			}
+		}(peer)
 	}
 
+	// Wait for all goroutines to finish
+	wg.Wait()
+	close(successChan)
+	close(failChan)
+
+	// Count results
+	successCount := len(successChan)
+	failureCount := len(failChan)
+
+	if failureCount > 0 {
+		logger.Warn("partial replication", zap.Int("success", successCount), zap.Int("failure", failureCount))
+		http.Error(w, "Partial replication", http.StatusAccepted)
+		return
+	}
+
+	logger.Info("full replication success", zap.Int("success", successCount))
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintln(w, "Write replicated successfully")
+	fmt.Fprintf(w, "Write replicated to %d peers\n", successCount)
 }
 
 func ReadKV(w http.ResponseWriter, r *http.Request) {
