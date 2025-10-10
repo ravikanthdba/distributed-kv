@@ -25,7 +25,6 @@ var (
 
 func WriteKV(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		logger.Warn("method not allowed")
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
@@ -38,44 +37,48 @@ func WriteKV(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		logger.Warn("failed to read body", zap.Error(err))
 		http.Error(w, "Read error", http.StatusInternalServerError)
 		return
 	}
 	defer r.Body.Close()
 
-	// Step 1: Local write
+	// Step 1: Local write
 	kvStore.store[key] = body
 	logger.Info("local write", zap.String("key", key), zap.ByteString("value", body))
 
-	// Step 2: Replicate to peers
-	successCount := 1 // local node already succeeded
-	for _, peer := range peers {
-		go func(peer string) {
-			url := fmt.Sprintf("%s/write?key=%s", peer, key)
-			req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
-			req.Header.Set("Content-Type", "text/plain")
-
-			client := &http.Client{Timeout: 2 * time.Second}
-			resp, err := client.Do(req)
-			if err != nil {
-				logger.Error("replication failed", zap.String("peer", peer), zap.Error(err))
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				logger.Info("replication success", zap.String("peer", peer))
-				successCount++
-			} else {
-				logger.Warn("peer returned non-OK", zap.String("peer", peer), zap.Int("status", resp.StatusCode))
-			}
-		}(peer)
+	// Step 2: Check if this is a replication request
+	if r.Header.Get("X-Replicated") == "true" {
+		// Don't replicate further
+		logger.Info("replication request received — not re‑replicating",
+			zap.String("key", key))
+		w.WriteHeader(http.StatusOK)
+		return
 	}
 
-	// Step 3: Return success (simplified – not waiting on all)
+	// Step 3: Replicate to peers
+	for _, peer := range peers {
+		url := fmt.Sprintf("%s/write?key=%s", peer, key)
+		req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "text/plain")
+		req.Header.Set("X-Replicated", "true") // ✅ mark replication request
+
+		client := &http.Client{Timeout: 5 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Error("replication failed", zap.String("peer", peer), zap.Error(err))
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			logger.Info("replication success", zap.String("peer", peer))
+		} else {
+			logger.Warn("peer returned non‑OK", zap.String("peer", peer),
+				zap.Int("status", resp.StatusCode))
+		}
+	}
+
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Write replicated to %d nodes\n", successCount)
+	fmt.Fprintln(w, "Write replicated successfully")
 }
 
 func ReadKV(w http.ResponseWriter, r *http.Request) {
