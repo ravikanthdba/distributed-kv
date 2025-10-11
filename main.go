@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"go.uber.org/zap"
 	"io"
@@ -10,29 +11,29 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gorilla/mux"
 )
 
 type KVStore struct {
 	store map[string][]byte
+	mu    sync.RWMutex
 }
 
 var (
 	kvStore KVStore
 	logger  *zap.Logger
-	peers   []string
+	peersMu sync.RWMutex
+	peers   = make(map[string]bool) // dynamic peer list with health
+	selfURL string                  // current node's own address
 )
 
-func WriteKV(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
+type PeerJoinRequest struct {
+	Address string `json:"address"`
+}
 
+func WriteKV(w http.ResponseWriter, r *http.Request) {
 	key := r.URL.Query().Get("key")
 	if key == "" {
-		http.Error(w, "Missing 'key' query param", http.StatusBadRequest)
+		http.Error(w, "Missing key", http.StatusBadRequest)
 		return
 	}
 
@@ -43,69 +44,48 @@ func WriteKV(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	// Step 1: Local write
+	// Write locally
+	kvStore.mu.Lock()
 	kvStore.store[key] = body
-	logger.Info("local write", zap.String("key", key), zap.ByteString("value", body))
+	kvStore.mu.Unlock()
 
-	// Step 2: Check if this is a replication request
 	if r.Header.Get("X-Replicated") == "true" {
-		logger.Info("replication request received — not re‑replicating", zap.String("key", key))
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// Step 3: Parallel Replication with WaitGroup
+	// Fan-out replication
 	var wg sync.WaitGroup
-	successChan := make(chan string, len(peers))
-	failChan := make(chan string, len(peers))
-
-	for _, peer := range peers {
+	peersMu.RLock()
+	for peer := range peers {
+		if peer == selfURL {
+			continue // do not replicate to self
+		}
 		wg.Add(1)
 		go func(peer string) {
 			defer wg.Done()
-
 			url := fmt.Sprintf("%s/write?key=%s", peer, key)
 			req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 			req.Header.Set("Content-Type", "text/plain")
-			req.Header.Set("X-Replicated", "true") // prevent re-replication
+			req.Header.Set("X-Replicated", "true")
 
-			client := &http.Client{Timeout: 3 * time.Second}
+			client := &http.Client{Timeout: 2 * time.Second}
 			resp, err := client.Do(req)
-			if err != nil {
-				logger.Error("replication failed", zap.String("peer", peer), zap.Error(err))
-				failChan <- peer
+			if err != nil || resp.StatusCode != http.StatusOK {
+				logger.Warn("peer replication failed", zap.String("peer", peer))
+				peersMu.Lock()
+				delete(peers, peer) // remove unhealthy peer
+				peersMu.Unlock()
 				return
 			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == http.StatusOK {
-				logger.Info("replication success", zap.String("peer", peer))
-				successChan <- peer
-			} else {
-				logger.Warn("peer returned non-OK", zap.String("peer", peer), zap.Int("status", resp.StatusCode))
-				failChan <- peer
-			}
+			resp.Body.Close()
 		}(peer)
 	}
-
-	// Wait for all goroutines to finish
+	peersMu.RUnlock()
 	wg.Wait()
-	close(successChan)
-	close(failChan)
 
-	// Count results
-	successCount := len(successChan)
-	failureCount := len(failChan)
-
-	if failureCount > 0 {
-		logger.Warn("partial replication", zap.Int("success", successCount), zap.Int("failure", failureCount))
-		http.Error(w, "Partial replication", http.StatusAccepted)
-		return
-	}
-
-	logger.Info("full replication success", zap.Int("success", successCount))
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Write replicated to %d peers\n", successCount)
+	fmt.Fprintf(w, "Write success for key=%s\n", key)
 }
 
 func ReadKV(w http.ResponseWriter, r *http.Request) {
@@ -135,34 +115,80 @@ func ReadKV(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, string(value))
 }
 
+// Peer joins cluster
+func JoinPeer(w http.ResponseWriter, r *http.Request) {
+	var req PeerJoinRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
+	if err != nil || req.Address == "" {
+		http.Error(w, "Invalid request", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if req.Address == selfURL {
+		w.WriteHeader(http.StatusOK)
+		return // do not add self
+	}
+
+	peersMu.Lock()
+	peers[req.Address] = true
+	peersMu.Unlock()
+
+	logger.Info("Peer joined", zap.String("address", req.Address))
+	w.WriteHeader(http.StatusOK)
+}
+
+func ListPeers(w http.ResponseWriter, r *http.Request) {
+	peersMu.RLock()
+	defer peersMu.RUnlock()
+
+	list := make([]string, 0, len(peers))
+	for peer := range peers {
+		list = append(list, peer)
+	}
+	_ = json.NewEncoder(w).Encode(list)
+}
+
+func BootstrapPeers() {
+	initial := os.Getenv("PEERS")
+	self := os.Getenv("SELF")
+	if self == "" {
+		logger.Fatal("SELF env variable not set")
+	}
+	selfURL = self
+
+	if initial == "" {
+		return
+	}
+	for _, p := range strings.Split(initial, ",") {
+		if p == self {
+			continue // don't include self in peer list
+		}
+		peers[p] = true
+	}
+}
+
 func main() {
+
 	var err error
 	logger, err = zap.NewProduction()
 	if err != nil {
-		panic("failed to create logger")
+		panic("logger error")
 	}
 	defer logger.Sync()
 
 	kvStore = KVStore{store: make(map[string][]byte)}
+	BootstrapPeers()
 
-	// Read port and peers from environment
+	http.HandleFunc("/write", WriteKV)
+	http.HandleFunc("/read", ReadKV)
+	http.HandleFunc("/join", JoinPeer)
+	http.HandleFunc("/peers", ListPeers)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	peerEnv := os.Getenv("PEERS")
-	if peerEnv != "" {
-		peers = strings.Split(peerEnv, ",")
-		logger.Info("configured peers", zap.Strings("peers", peers))
-	}
-
-	r := mux.NewRouter()
-	r.HandleFunc("/write", WriteKV).Methods("POST")
-	r.HandleFunc("/read", ReadKV).Methods("GET")
-
-	addr := fmt.Sprintf(":%s", port)
-	logger.Info("Server starting", zap.String("addr", addr))
-	if err := http.ListenAndServe(addr, r); err != nil {
-		logger.Fatal("server error", zap.Error(err))
-	}
+	logger.Info("starting server", zap.String("port", port))
+	_ = http.ListenAndServe(":"+port, nil)
 }
