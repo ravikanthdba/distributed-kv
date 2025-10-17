@@ -1,0 +1,75 @@
+Distributed-kv Pending issues list
+
+🐞 Issues Identified (No Descriptions, Just List)
+	1.	Existing data is not replicated to newly joined nodes.
+	2.	No automatic peer discovery — requires manual /join API call.
+	3.	No gossip protocol or failure detection for peer liveness.
+	4.	Peer removal is not implemented — no /leave or health expiry.
+	5.	Replication is fire-and-forget — no quorum / consensus logic.
+	6.	No versioning or conflict resolution for concurrent writes.
+	7.	Read from local store only — no fallback to peers.
+	8.	No sharding or partitioning — all nodes replicate all keys.
+	9.	No durability — data is stored only in-memory (not persisted).
+	10.	No consistency model — eventual vs strong not defined.
+	11.	No authentication or authorization between nodes.
+	12.	No encryption (TLS) in peer-to-peer communication.
+	13.	No metrics or observability (logs only, no Prometheus, etc.).
+	14.	No data compaction or GC.
+	15.	No support for snapshotting or backups.
+	16.	No rate limiting or load shedding.
+	17.	No backpressure handling in replication fan-out.
+	18.	No write-ahead logging (WAL) for recovery.
+	19.	No leadership election (no Raft or similar yet).
+	20.	No clock synchronization (NTP) to resolve timestamp-based logic.
+	21.	No protection from split brain or duplicate cluster formation.
+	22.	Testing support is missing (unit, integration, chaos).
+	23.	No multi-tenancy or namespacing.
+	24.	No audit logging for key access history.
+
+
+⸻
+
+
+🔁 Replication Issues
+	1.	No quorum-based write confirmation
+	2.	No versioning or last-write-wins handling
+	3.	No deduplication for concurrent replication
+	4.	All writes are full replication — no support for sharding
+
+⸻
+
+🧩 Cluster Management Issues
+	5.	Manual peer join — no automatic peer propagation
+	6.	No peer metadata (e.g., node ID, join time)
+	7.	No heartbeats or active health monitoring
+	8.	No rejoin support for transiently failing nodes
+	9.	No peer leave/removal mechanism
+	10.	Inconsistent peer view across nodes
+	11.	Peer list is not gossiped
+	12.	No distinction between leader and follower roles
+
+⸻
+
+💾 Data Management Issues
+	13.	No persistence (in-memory only)
+	14.	New peers don’t get previous data (no bootstrap sync)
+	15.	No background repair mechanism
+	16.	No conflict resolution
+	17.	No TTL or key expiry support
+
+⸻
+
+🚧 Code Robustness / Design
+	18.	No retries for failed replication attempts
+	19.	Peer failure results in immediate removal (aggressive)
+	20.	No error feedback to clients on partial replication
+	21.	Peer list shared via shared memory only — not persisted or replicated
+	22.	No metrics or observability for replication success/failure
+	23.	No graceful shutdown/cleanup of replication goroutines
+	24.	No config validation at startup
+
+⸻ To be taken up later
+
+🔐 Security
+	25.	No authentication on /join or /write endpoints
+	26.	Any node can join cluster if it knows endpoint
